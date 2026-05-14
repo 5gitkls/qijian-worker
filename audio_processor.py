@@ -15,11 +15,14 @@ MelodAI Python Audio Processor
 import os
 import json
 import time
+import hmac
+import hashlib
 import logging
 import tempfile
 import traceback
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse, urlencode
 
 import numpy as np
 import redis
@@ -48,11 +51,14 @@ REDIS_DB = int(os.getenv("REDIS_DB", 0))
 QUEUE_KEY = "melodai:audio_queue"                      # Redis Stream key（与 qijian-infer 写入的队列一致）
 CONSUMER_GROUP = "qijian-worker-group"
 CONSUMER_NAME = f"worker_{os.getpid()}"
+PENDING_IDLE_MS = int(os.getenv("PENDING_IDLE_MS", "60000"))
+PENDING_RETRY_COUNT = int(os.getenv("PENDING_RETRY_COUNT", "20"))
 
 ACE_STEP_BASE_URL = os.getenv("ACE_STEP_BASE_URL", "http://127.0.0.1:8000")
 # qijian-api 默认端口为 80（application.yml: server.port=80）
 # 生产环境通过环境变量 JAVA_CALLBACK_URL 覆盖
 JAVA_CALLBACK_URL = os.getenv("JAVA_CALLBACK_URL", "http://127.0.0.1:80/api/music/callback")
+JAVA_CALLBACK_SECRET = os.getenv("JAVA_CALLBACK_SECRET", os.getenv("MUSIC_INTERNAL_CALLBACK_SECRET", ""))
 
 # OSS / S3 配置
 OSS_ENDPOINT = os.getenv("OSS_ENDPOINT", "")
@@ -307,14 +313,42 @@ def download_ace_step_audio(audio_path: str, dest: Path) -> Path:
 # ─────────────────────────────────────────────
 # Java 回调
 # ─────────────────────────────────────────────
+def _callback_path(url: str) -> str:
+    parsed = urlparse(url)
+    return parsed.path or "/"
+
+
+def build_internal_callback_headers(method: str, path: str, query: str = "") -> dict:
+    """构造 Java 内部回调 HMAC 签名请求头，与 qijian-api 拦截器保持一致。"""
+    headers = {"Content-Type": "application/json"}
+    if not JAVA_CALLBACK_SECRET:
+        logger.warning("JAVA_CALLBACK_SECRET 未设置，内部回调将不携带签名头，生产环境应拒绝此配置")
+        return headers
+    timestamp = str(int(time.time()))
+    nonce = hashlib.sha256(f"{timestamp}:{os.getpid()}:{time.time_ns()}".encode("utf-8")).hexdigest()[:32]
+    canonical = "\n".join([timestamp, nonce, method.upper(), path, query or ""])
+    signature = hmac.new(
+        JAVA_CALLBACK_SECRET.encode("utf-8"),
+        canonical.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    headers.update({
+        "X-Internal-Timestamp": timestamp,
+        "X-Internal-Nonce": nonce,
+        "X-Internal-Signature": signature,
+    })
+    return headers
+
+
 def notify_java_backend(task_id: str, payload: dict) -> bool:
     """通知 Java 后端任务处理结果。"""
     try:
+        request_body = json.dumps({"taskId": task_id, **payload}, ensure_ascii=False, separators=(",", ":"))
         resp = requests.post(
             JAVA_CALLBACK_URL,
-            json={"taskId": task_id, **payload},
+            data=request_body.encode("utf-8"),
             timeout=10,
-            headers={"Content-Type": "application/json"},
+            headers=build_internal_callback_headers("POST", _callback_path(JAVA_CALLBACK_URL), ""),
         )
         resp.raise_for_status()
         logger.info(f"Java 回调成功: taskId={task_id}")
@@ -413,6 +447,42 @@ def handle_task(task_data: dict, rdb: redis.Redis) -> None:
 # ─────────────────────────────────────────────
 # Worker 主循环（Redis Stream）
 # ─────────────────────────────────────────────
+def _process_pending_messages(rdb: redis.Redis) -> None:
+    """启动时认领并重试长时间未确认的 Pending 消息。"""
+    try:
+        pending = rdb.xpending_range(
+            QUEUE_KEY,
+            CONSUMER_GROUP,
+            min="-",
+            max="+",
+            count=PENDING_RETRY_COUNT,
+        )
+        if not pending:
+            return
+        logger.info("发现 %d 条音频后处理 Pending 消息，开始恢复处理", len(pending))
+        for item in pending:
+            msg_id = item.get("message_id") if isinstance(item, dict) else item[0]
+            idle = item.get("time_since_delivered") if isinstance(item, dict) else item[2]
+            if idle is not None and int(idle) < PENDING_IDLE_MS:
+                continue
+            claimed_entries = rdb.xclaim(
+                QUEUE_KEY,
+                CONSUMER_GROUP,
+                CONSUMER_NAME,
+                min_idle_time=PENDING_IDLE_MS,
+                message_ids=[msg_id],
+            )
+            for claimed_msg_id, fields in claimed_entries:
+                try:
+                    logger.info("重新处理音频后处理 Pending 消息: msg_id=%s", claimed_msg_id)
+                    handle_task(fields, rdb)
+                    rdb.xack(QUEUE_KEY, CONSUMER_GROUP, claimed_msg_id)
+                except Exception as exc:
+                    logger.error("Pending 音频消息处理失败: msg_id=%s error=%s", claimed_msg_id, exc)
+    except redis.exceptions.ResponseError as exc:
+        logger.warning("读取音频后处理 Pending 消息失败，跳过本轮恢复: %s", exc)
+
+
 def run_worker() -> None:
     """
     使用 Redis Stream（XREADGROUP）消费任务队列。
@@ -431,6 +501,7 @@ def run_worker() -> None:
             raise
 
     logger.info(f"Worker 启动: {CONSUMER_NAME}，监听队列: {QUEUE_KEY}")
+    _process_pending_messages(rdb)
 
     while True:
         try:
