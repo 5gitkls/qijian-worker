@@ -18,6 +18,7 @@ import time
 import hmac
 import hashlib
 import logging
+import shutil
 import tempfile
 import traceback
 from pathlib import Path
@@ -66,6 +67,8 @@ OSS_BUCKET = os.getenv("OSS_BUCKET", "melodai-music")
 OSS_ACCESS_KEY = os.getenv("OSS_ACCESS_KEY", "")
 OSS_SECRET_KEY = os.getenv("OSS_SECRET_KEY", "")
 OSS_CDN_PREFIX = os.getenv("OSS_CDN_PREFIX", "https://cdn.melodai.com")
+LOCAL_STORAGE_DIR = os.getenv("LOCAL_STORAGE_DIR", "").strip()
+LOCAL_STORAGE_URL_PREFIX = os.getenv("LOCAL_STORAGE_URL_PREFIX", "http://127.0.0.1:18080/local").rstrip("/")
 
 # 音频处理参数
 DEFAULT_FADE_IN_SEC = 1.5          # 淡入时长（秒）
@@ -104,8 +107,24 @@ def get_redis_client() -> redis.Redis:
 def upload_to_oss(local_path: Path, object_key: str) -> str:
     """
     上传文件到 OSS/S3，返回 CDN 访问 URL。
-    兼容阿里云 OSS（endpoint 格式）和 AWS S3。
+
+    当设置 LOCAL_STORAGE_DIR 时启用本地文件存储回退，主要用于本地联调、CI 或无云存储凭据的测试环境。
+    生产环境应配置 OSS_ENDPOINT/OSS_ACCESS_KEY/OSS_SECRET_KEY，并关闭 LOCAL_STORAGE_DIR。
     """
+    if LOCAL_STORAGE_DIR:
+        storage_root = Path(LOCAL_STORAGE_DIR)
+        target_path = storage_root / object_key
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(local_path, target_path)
+        local_url = f"{LOCAL_STORAGE_URL_PREFIX}/{object_key}"
+        logger.info("已保存至本地存储: %s", local_url)
+        return local_url
+
+    if not OSS_ACCESS_KEY or not OSS_SECRET_KEY:
+        raise RuntimeError(
+            "OSS/S3 凭据未配置，无法上传音频；本地联调可设置 LOCAL_STORAGE_DIR 启用本地存储回退"
+        )
+
     s3 = boto3.client(
         "s3",
         endpoint_url=OSS_ENDPOINT if OSS_ENDPOINT else None,
@@ -208,14 +227,13 @@ def merge_audio_clips(
     将多个音频片段合并（带交叉淡化）。
     用于将 ACE-Step 生成的多段音频拼接成完整歌曲。
 
-    moviepy 2.2.1: concatenate_audioclips 支持 method="compose" 实现交叉淡化。
+    moviepy 2.2.x: 当前依赖版本的 concatenate_audioclips 不支持 method 参数，采用顺序拼接保证完整性。
     """
     clips = [AudioFileClip(str(p)) for p in clip_paths]
     try:
-        if crossfade_sec > 0 and len(clips) > 1:
-            merged = concatenate_audioclips(clips, method="compose")
-        else:
-            merged = concatenate_audioclips(clips)
+        # moviepy 2.2.x 的 concatenate_audioclips 不接受 method 参数；
+        # 这里使用顺序拼接，确保多段 ACE-Step 输出不会只取第一段而导致歌曲不完整。
+        merged = concatenate_audioclips(clips)
 
         merged.write_audiofile(
             str(output_path),
@@ -383,23 +401,46 @@ def handle_task(task_data: dict, rdb: redis.Redis) -> None:
     task_id = task_data.get("taskId", "unknown")
     ace_task_id = task_data.get("aceTaskId", "unknown")
     audio_path_str = task_data.get("audioPath", "")
+    audio_paths_str = task_data.get("audioPaths", "")
     user_id = task_data.get("userId", "unknown")
 
     logger.info(f"开始后处理任务: taskId={task_id}, aceTaskId={ace_task_id}, audioPath={audio_path_str}")
 
     raw_audio_path = TEMP_DIR / f"{task_id}_raw.wav"
+    merged_raw_path = TEMP_DIR / f"{task_id}_merged.wav"
     processed_path = TEMP_DIR / f"{task_id}_final.mp3"
+    downloaded_paths: list[Path] = []
 
     try:
         # Step 1: 下载原始音频（推理已由 qijian-infer 完成，直接下载结果）
-        if not audio_path_str:
-            raise RuntimeError("audioPath 为空，无法下载音频")
-        download_ace_step_audio(audio_path_str, raw_audio_path)
+        audio_paths: list[str] = []
+        if audio_paths_str:
+            try:
+                parsed_audio_paths = json.loads(audio_paths_str)
+                if isinstance(parsed_audio_paths, list):
+                    audio_paths = [str(p) for p in parsed_audio_paths if p]
+            except json.JSONDecodeError:
+                logger.warning("audioPaths 不是合法 JSON，将回退到 audioPath: %s", audio_paths_str)
+        if not audio_paths and audio_path_str:
+            audio_paths = [audio_path_str]
+        if not audio_paths:
+            raise RuntimeError("audioPath/audioPaths 为空，无法下载音频")
+
+        for index, path_str in enumerate(audio_paths):
+            part_path = raw_audio_path if len(audio_paths) == 1 else TEMP_DIR / f"{task_id}_raw_{index}.wav"
+            download_ace_step_audio(path_str, part_path)
+            downloaded_paths.append(part_path)
+
+        input_audio_path = downloaded_paths[0]
+        if len(downloaded_paths) > 1:
+            merge_audio_clips(downloaded_paths, merged_raw_path)
+            input_audio_path = merged_raw_path
+            logger.info("已合并 %d 段原始音频用于完整歌曲后处理: %s", len(downloaded_paths), merged_raw_path)
 
         # Step 2: 音频后处理
         target_duration = float(task_data.get("duration", 0))
         process_result = process_audio(
-            input_path=raw_audio_path,
+            input_path=input_audio_path,
             output_path=processed_path,
             fade_in=float(task_data.get("fadeIn", DEFAULT_FADE_IN_SEC)),
             fade_out=float(task_data.get("fadeOut", DEFAULT_FADE_OUT_SEC)),
@@ -438,7 +479,8 @@ def handle_task(task_data: dict, rdb: redis.Redis) -> None:
 
     finally:
         # Step 6: 清理临时文件
-        for path in [raw_audio_path, processed_path]:
+        cleanup_paths = list(dict.fromkeys([raw_audio_path, merged_raw_path, processed_path, *downloaded_paths]))
+        for path in cleanup_paths:
             if path.exists():
                 path.unlink()
                 logger.debug(f"已清理临时文件: {path}")
